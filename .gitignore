@@ -1,0 +1,35 @@
+# dependencies
+node_modules/
+/.pnp
+.pnp.js
+
+# testing
+/coverage
+
+# production build
+/dist
+
+# environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# editor & OS
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.log
+
+# misc
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# original source files (not needed in repo)
+extracted_code.txt
+*.pdf
