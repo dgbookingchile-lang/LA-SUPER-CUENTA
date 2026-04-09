@@ -313,26 +313,52 @@ export default function App() {
     const generationConfig = {};
     if (forceJSON && !base64Data) generationConfig.responseMimeType = "application/json";
     
-    const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ contents: [{ parts }], generationConfig })
-    });
-    if (!res.ok) {
-      const errBody = await res.text().catch(() => '');
-      console.error('Gemini API error body:', errBody);
-      throw new Error(`Gemini API error: ${res.status}`);
+    const requestBody = JSON.stringify({ contents: [{ parts }], generationConfig });
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`;
+    
+    // Retry logic with exponential backoff for 429 (rate limit) errors
+    const MAX_RETRIES = 3;
+    let lastError = null;
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      if (attempt > 0) {
+        const waitMs = Math.min(2000 * Math.pow(2, attempt - 1), 10000); // 2s, 4s, 8s
+        console.log(`Gemini 429 retry ${attempt}/${MAX_RETRIES}, waiting ${waitMs}ms...`);
+        await new Promise(r => setTimeout(r, waitMs));
+      }
+      
+      const res = await fetch(url, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: requestBody
+      });
+      
+      if (res.status === 429) {
+        lastError = new Error('Límite de solicitudes excedido. Espera unos segundos e intenta de nuevo.');
+        continue; // retry
+      }
+      
+      if (!res.ok) {
+        const errBody = await res.text().catch(() => '');
+        console.error('Gemini API error body:', errBody);
+        if (res.status === 400) throw new Error('Solicitud inválida. Revisa el formato de tu mensaje o imagen.');
+        if (res.status === 403) throw new Error('API Key sin permisos. Revisa tu VITE_GEMINI_API_KEY.');
+        throw new Error(`Error del servidor de IA (${res.status}). Intenta de nuevo.`);
+      }
+      
+      const data = await res.json();
+      const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+      console.log('Gemini raw response:', rawText.substring(0, 500));
+      
+      if (!forceJSON) return rawText;
+      
+      const parsed = extractJSON(rawText);
+      if (parsed !== null) return parsed;
+      
+      console.error('Gemini JSON parse failed. Raw:', rawText);
+      throw new Error('No se pudo interpretar la respuesta de la IA');
     }
-    const data = await res.json();
-    const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-    console.log('Gemini raw response:', rawText.substring(0, 500));
     
-    if (!forceJSON) return rawText;
-    
-    const parsed = extractJSON(rawText);
-    if (parsed !== null) return parsed;
-    
-    console.error('Gemini JSON parse failed. Raw:', rawText);
-    throw new Error('No se pudo interpretar la respuesta de la IA');
+    // All retries exhausted
+    throw lastError || new Error('Límite de solicitudes excedido tras varios intentos. Espera 1 minuto.');
   };
 
   const updateAccountBalance = (accId, pKey, amount, operation, accList = accounts) => {
