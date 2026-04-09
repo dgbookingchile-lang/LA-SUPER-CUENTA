@@ -9,7 +9,7 @@ import { auth, db, getUserCollection, getUserDocRef, getGlobalCollection } from 
 import { signInWithEmailAndPassword, createUserWithEmailAndPassword, onAuthStateChanged, signOut, GoogleAuthProvider, signInWithPopup } from 'firebase/auth';
 import { onSnapshot, addDoc, setDoc, deleteDoc, updateDoc } from 'firebase/firestore';
 
-const GEMINI_MODEL = "gemini-2.0-flash";
+const GEMINI_MODEL = "gemini-1.5-flash";
 const PROFILE_COLORS = ['bg-emerald-500', 'bg-amber-500', 'bg-cyan-500', 'bg-pink-500', 'bg-rose-500', 'bg-blue-500'];
 const DEFAULT_ACCOUNTS = [
   { id: 'cash_usd', name: 'Efectivo USD', currency: 'USD', balances: { personal: 0, b1: 0 }, color: 'bg-emerald-100 text-emerald-600', icon: '💵' },
@@ -448,7 +448,12 @@ Responde ÚNICAMENTE un JSON válido (sin markdown, sin explicación): {"monto":
           setReviewItems(preparedItems);
           addBotMsg(`📊 Extraje ${preparedItems.length} registro(s). Revisa y confirma.`);
         } else addBotMsg("⚠ No logré detectar gastos claros en la imagen.");
-      } catch (err) { addBotMsg("🚨 Error procesando la imagen."); } finally { setIsAnalyzingImage(false); e.target.value = ''; }
+      } catch (err) { 
+        console.error("Image analysis error:", err);
+        addBotMsg(`🚨 Error procesando la imagen: ${err.message || "Error desconocido"}. Revisa la consola o tu API Key.`); 
+      } finally { 
+        setIsAnalyzingImage(false); e.target.value = ''; 
+      }
     };
     reader.readAsDataURL(file);
   };
