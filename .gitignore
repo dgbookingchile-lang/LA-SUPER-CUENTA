@@ -33,3 +33,6 @@ yarn-error.log*
 # original source files (not needed in repo)
 extracted_code.txt
 *.pdf
+
+# Local Netlify folder
+.netlify

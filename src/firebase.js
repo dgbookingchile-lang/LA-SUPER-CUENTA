@@ -29,6 +29,9 @@ try {
 export const auth = getAuth(app);
 export const db = getFirestore(app);
 
-// Helpers de colección — ruta plana
-export const getCollection = (colName) => collection(db, colName);
-export const getDocRef = (colName, docId) => doc(db, colName, docId);
+// Helpers de colección — rutas multitenant
+export const getUserCollection = (uid, colName) => collection(db, `users/${uid}/${colName}`);
+export const getUserDocRef = (uid, colName, docId) => doc(db, `users/${uid}/${colName}`, docId);
+
+// Colecciones públicas (como rates_history)
+export const getGlobalCollection = (colName) => collection(db, colName);

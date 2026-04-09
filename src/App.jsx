@@ -5,7 +5,7 @@ import {
   Settings, Star, Building2, History, BookOpen, Trash2, Calendar,
   Download, Activity, Clock, Edit2, Percent, Camera, ImagePlus, CheckCircle2, LayoutDashboard, Briefcase, PlusCircle, BarChart3, Lock, Mail, LogOut
 } from 'lucide-react';
-import { auth, db, getCollection, getDocRef } from './firebase';
+import { auth, db, getUserCollection, getUserDocRef, getGlobalCollection } from './firebase';
 import { signInWithEmailAndPassword, createUserWithEmailAndPassword, onAuthStateChanged, signOut, GoogleAuthProvider, signInWithPopup } from 'firebase/auth';
 import { onSnapshot, addDoc, setDoc, deleteDoc, updateDoc } from 'firebase/firestore';
 
@@ -137,22 +137,23 @@ export default function App() {
 
   useEffect(() => {
     if (!fbUser || authScreen !== 'app') return;
-    const unsubTx = onSnapshot(getCollection('transactions'), snap => {
+    const uid = fbUser.uid;
+    const unsubTx = onSnapshot(getUserCollection(uid, 'transactions'), snap => {
       setTransactions(snap.docs.map(d => {
         const data = d.data();
         if (data.perfil === 'negocio') data.perfil = 'b1';
         return { ...data, fbid: d.id };
       }).sort((a, b) => new Date(b.date) - new Date(a.date)));
     });
-    const unsubDebts = onSnapshot(getCollection('debts'), snap => {
+    const unsubDebts = onSnapshot(getUserCollection(uid, 'debts'), snap => {
       setDebts(snap.docs.map(d => {
         const data = d.data();
         if (data.profile === 'negocio') data.profile = 'b1';
         return { ...data, fbid: d.id };
       }).sort((a, b) => new Date(b.date) - new Date(a.date)));
     });
-    const unsubRates = onSnapshot(getCollection('rates_history'), snap => setRatesHistory(snap.docs.map(d => d.data())));
-    const unsubState = onSnapshot(getCollection('app_state'), snap => {
+    const unsubRates = onSnapshot(getGlobalCollection('rates_history'), snap => setRatesHistory(snap.docs.map(d => d.data())));
+    const unsubState = onSnapshot(getUserCollection(uid, 'app_state'), snap => {
       const accDoc = snap.docs.find(d => d.id === 'accounts_doc');
       if (accDoc?.data()?.items) {
         const migratedAccs = accDoc.data().items.map(acc => {
@@ -234,8 +235,9 @@ export default function App() {
   };
 
   const syncAccounts = (newAccounts) => {
+    if (!fbUser) return;
     setAccounts(newAccounts);
-    setDoc(getDocRef('app_state', 'accounts_doc'), { items: newAccounts }).catch(console.error);
+    setDoc(getUserDocRef(fbUser.uid, 'app_state', 'accounts_doc'), { items: newAccounts }).catch(console.error);
   };
 
   const fetchOfficialRate = async (isManualForced = false) => {
@@ -243,11 +245,11 @@ export default function App() {
     try {
       const res = await fetch('https://ve.dolarapi.com/v1/dolares/oficial');
       const data = await res.json();
-      if (data?.promedio) {
+      if (data?.promedio && fbUser) {
         const now = new Date().toISOString();
         const updater = isManualForced ? getAuthorInfo(activeAuthorId).name : 'Sistema Auto';
-        setDoc(getDocRef('app_state', 'settings_doc'), { exchangeRate: data.promedio, spread, last_updated_at: now, last_updated_by: updater }, { merge: true });
-        addDoc(getCollection('rates_history'), { date: now.split('T')[0], rate: data.promedio, timestamp: now });
+        setDoc(getUserDocRef(fbUser.uid, 'app_state', 'settings_doc'), { exchangeRate: data.promedio, spread, last_updated_at: now, last_updated_by: updater }, { merge: true });
+        addDoc(getGlobalCollection('rates_history'), { date: now.split('T')[0], rate: data.promedio, timestamp: now });
         if (isManualForced) showToast(`Tasa actualizada: ${data.promedio} VEF/USD`);
         else addBotMsg(`✅ Tasa BCV Oficial sincronizada: ${data.promedio} BS.`);
       }
@@ -269,7 +271,8 @@ export default function App() {
       .map(b => ({ ...b, name: String(b.name).trim().substring(0, 18) }));
     if (finalBusinesses.length === 0) finalBusinesses.push({ id: 'b1', name: 'Negocio Principal' });
     
-    setDoc(getDocRef('app_state', 'settings_doc'), {
+    if (!fbUser) return;
+    setDoc(getUserDocRef(fbUser.uid, 'app_state', 'settings_doc'), {
       exchangeRate: r, spread: s, userNames: { u1: finalU1, u2: finalU2 }, userIcons: finalIcons, businesses: finalBusinesses,
       last_updated_at: new Date().toISOString(), last_updated_by: getAuthorInfo(activeAuthorId).name
     }, { merge: true });
@@ -372,7 +375,7 @@ Responde ÚNICAMENTE un JSON válido (sin markdown, sin explicación): {"monto":
     
     if (tipo !== 'ajuste_saldo') {
       const txDate = retroConfig.isRetro && retroConfig.date ? new Date(`${retroConfig.date}T12:00:00Z`).toISOString() : new Date().toISOString();
-      addDoc(getCollection('transactions'), {
+      addDoc(getUserCollection(fbUser.uid, 'transactions'), {
         amount: amountUSD, type: tipo === 'ingreso' ? 'income' : 'expense', category: String(categoria || 'General'), concept: String(concepto || `Movimiento`),
         date: txDate, registration_date: new Date().toISOString(), is_retroactive: retroConfig.isRetro, affects_balance: retroConfig.affectsBalance,
         monto_original: monto, moneda_original: String(moneda), tasa_historica: finalRate, cuenta_id: String(cuenta_id), perfil: String(perfil), author: activeAuthorId
@@ -387,7 +390,7 @@ Responde ÚNICAMENTE un JSON válido (sin markdown, sin explicación): {"monto":
     if (txToDelete.affects_balance !== false && txToDelete.cuenta_id) {
       syncAccounts(updateAccountBalance(txToDelete.cuenta_id, txToDelete.perfil, txToDelete.amount, txToDelete.type === 'expense' ? 'add' : 'subtract'));
     }
-    await deleteDoc(getDocRef('transactions', txToDelete.fbid)).catch(console.error);
+    await deleteDoc(getUserDocRef(fbUser.uid, 'transactions', txToDelete.fbid)).catch(console.error);
     addBotMsg(`🗑 Transacción borrada por ${getAuthorInfo(activeAuthorId).name}.`); setTxToDelete(null);
   };
 
@@ -407,14 +410,14 @@ Responde ÚNICAMENTE un JSON válido (sin markdown, sin explicación): {"monto":
     
     const { fbid: _ignoreId, ...txWithoutFbid } = oldTx;
     const updatedTx = { ...txWithoutFbid, amount: newAmountUSD, monto_original: newMonto, concept: String(txToEdit.concept), date: new Date(`${txToEdit.dateStr}T12:00:00Z`).toISOString(), author: String(txToEdit.author), cuenta_id: String(txToEdit.cuenta_id), perfil: String(txToEdit.perfil), last_edited_by: activeAuthorId, last_edited_at: new Date().toISOString() };
-    await updateDoc(getDocRef('transactions', oldTx.fbid), updatedTx).catch(console.error);
+    await updateDoc(getUserDocRef(fbUser.uid, 'transactions', oldTx.fbid), updatedTx).catch(console.error);
     addBotMsg(`✏ Transacción editada con éxito.`); setTxToEdit(null);
   };
 
   const handleDebtSubmit = async (e) => {
     e.preventDefault();
     if (!debtForm.creditor || !debtForm.amount || !fbUser) return;
-    await addDoc(getCollection('debts'), { creditor: String(debtForm.creditor), amountUSD: parseFloat(debtForm.amount) || 0, profile: String(debtForm.profile), date: new Date().toISOString(), author: activeAuthorId }).catch(console.error);
+    await addDoc(getUserCollection(fbUser.uid, 'debts'), { creditor: String(debtForm.creditor), amountUSD: parseFloat(debtForm.amount) || 0, profile: String(debtForm.profile), date: new Date().toISOString(), author: activeAuthorId }).catch(console.error);
     setDebtForm({ creditor: '', amount: '', profile: 'personal' });
   };
 
@@ -466,7 +469,7 @@ Responde ÚNICAMENTE un JSON válido (sin markdown, sin explicación): {"monto":
     for (const item of reviewItems) {
       const amountUSD = item.moneda === 'BS' ? parseFloat((item.monto / currentEffectiveRate).toFixed(2)) : parseFloat(item.monto);
       updatedAccs = updateAccountBalance(item.cuenta_id, item.perfil, amountUSD, 'subtract', updatedAccs);
-      await addDoc(getCollection('transactions'), {
+      await addDoc(getUserCollection(fbUser.uid, 'transactions'), {
         amount: amountUSD, type: 'expense', category: 'General', concept: String(item.concepto || `Movimiento Extraído`),
         date: new Date(`${item.dateStr}T12:00:00Z`).toISOString(), registration_date: new Date().toISOString(),
         is_retroactive: false, affects_balance: true, monto_original: parseFloat(item.monto), moneda_original: String(item.moneda),
@@ -1038,7 +1041,7 @@ Responde ÚNICAMENTE un JSON válido (sin markdown, sin explicación): {"monto":
                     <p className="text-xl font-black text-rose-500 tracking-tighter">-${debt.amountUSD.toFixed(2)}</p>
                     <p className="text-[9px] font-bold text-slate-400 tracking-widest">≈ {(debt.amountUSD * currentEffectiveRate).toLocaleString('es-VE')} BS</p>
                   </div>
-                  <button type="button" onClick={() => deleteDoc(getDocRef('debts', debt.fbid)).catch(console.error)} className="p-2 text-slate-300 hover:text-rose-500 hover:bg-rose-50 rounded-xl transition-all opacity-40 group-hover:opacity-100"><Trash2 className="w-4 h-4" /></button>
+                  <button type="button" onClick={() => deleteDoc(getUserDocRef(fbUser.uid, 'debts', debt.fbid)).catch(console.error)} className="p-2 text-slate-300 hover:text-rose-500 hover:bg-rose-50 rounded-xl transition-all opacity-40 group-hover:opacity-100"><Trash2 className="w-4 h-4" /></button>
                 </div>
               </div>
             )})}
