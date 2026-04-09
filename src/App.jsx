@@ -9,7 +9,7 @@ import { auth, db, getUserCollection, getUserDocRef, getGlobalCollection } from 
 import { signInWithEmailAndPassword, createUserWithEmailAndPassword, onAuthStateChanged, signOut, GoogleAuthProvider, signInWithPopup } from 'firebase/auth';
 import { onSnapshot, addDoc, setDoc, deleteDoc, updateDoc } from 'firebase/firestore';
 
-const GEMINI_MODEL = "gemini-1.5-flash";
+const GEMINI_MODEL = "gemini-1.5-flash-latest";
 const PROFILE_COLORS = ['bg-emerald-500', 'bg-amber-500', 'bg-cyan-500', 'bg-pink-500', 'bg-rose-500', 'bg-blue-500'];
 const DEFAULT_ACCOUNTS = [
   { id: 'cash_usd', name: 'Efectivo USD', currency: 'USD', balances: { personal: 0, b1: 0 }, color: 'bg-emerald-100 text-emerald-600', icon: '💵' },
