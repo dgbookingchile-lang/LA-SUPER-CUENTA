@@ -9,7 +9,7 @@ import { auth, db, getUserCollection, getUserDocRef, getGlobalCollection } from 
 import { signInWithEmailAndPassword, createUserWithEmailAndPassword, onAuthStateChanged, signOut, GoogleAuthProvider, signInWithPopup } from 'firebase/auth';
 import { onSnapshot, addDoc, setDoc, deleteDoc, updateDoc } from 'firebase/firestore';
 
-const GEMINI_MODEL = "gemini-1.5-flash-latest";
+const GEMINI_MODEL = "gemini-2.0-flash";
 const PROFILE_COLORS = ['bg-emerald-500', 'bg-amber-500', 'bg-cyan-500', 'bg-pink-500', 'bg-rose-500', 'bg-blue-500'];
 const DEFAULT_ACCOUNTS = [
   { id: 'cash_usd', name: 'Efectivo USD', currency: 'USD', balances: { personal: 0, b1: 0 }, color: 'bg-emerald-100 text-emerald-600', icon: '💵' },
@@ -289,27 +289,50 @@ export default function App() {
     showToast(`Ajustes guardados exitosamente`);
   };
 
-  const fetchGeminiAI = async (prompt, base64Data = null, mimeType = null) => {
+  const extractJSON = (rawText) => {
+    // 1. Try direct parse
+    try { return JSON.parse(rawText); } catch (_) {}
+    // 2. Try extracting from markdown code blocks
+    const codeBlockMatch = rawText.match(/```(?:json)?\s*([\s\S]*?)```/);
+    if (codeBlockMatch) try { return JSON.parse(codeBlockMatch[1].trim()); } catch (_) {}
+    // 3. Try finding JSON object or array in the text
+    const jsonMatch = rawText.match(/(\[\s*\{[\s\S]*\}\s*\]|\{[\s\S]*\})/);
+    if (jsonMatch) try { return JSON.parse(jsonMatch[1]); } catch (_) {}
+    return null;
+  };
+
+  const fetchGeminiAI = async (prompt, base64Data = null, mimeType = null, forceJSON = true) => {
     const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
     if (!apiKey) throw new Error('VITE_GEMINI_API_KEY no configurada');
-    const parts = [{ text: prompt }];
+    
+    // For vision requests: image FIRST, then text prompt
+    const parts = [];
     if (base64Data && mimeType) parts.push({ inlineData: { mimeType, data: base64Data } });
+    parts.push({ text: prompt });
+    
+    const generationConfig = {};
+    if (forceJSON && !base64Data) generationConfig.responseMimeType = "application/json";
+    
     const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ contents: [{ parts }], generationConfig: { responseMimeType: "application/json" } })
+      body: JSON.stringify({ contents: [{ parts }], generationConfig })
     });
-    if (!res.ok) throw new Error(`Gemini API error: ${res.status}`);
-    const data = await res.json();
-    const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || (base64Data ? "[]" : "{}");
-    try {
-      return JSON.parse(rawText);
-    } catch (parseErr) {
-      console.error('Gemini JSON parse error:', rawText);
-      // Try to extract JSON from markdown code blocks
-      const match = rawText.match(/```(?:json)?\s*([\s\S]*?)```/);
-      if (match) return JSON.parse(match[1].trim());
-      throw parseErr;
+    if (!res.ok) {
+      const errBody = await res.text().catch(() => '');
+      console.error('Gemini API error body:', errBody);
+      throw new Error(`Gemini API error: ${res.status}`);
     }
+    const data = await res.json();
+    const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    console.log('Gemini raw response:', rawText.substring(0, 500));
+    
+    if (!forceJSON) return rawText;
+    
+    const parsed = extractJSON(rawText);
+    if (parsed !== null) return parsed;
+    
+    console.error('Gemini JSON parse failed. Raw:', rawText);
+    throw new Error('No se pudo interpretar la respuesta de la IA');
   };
 
   const updateAccountBalance = (accId, pKey, amount, operation, accList = accounts) => {
@@ -349,24 +372,37 @@ Perfiles válidos: personal, ${businessListStr}. Perfil sugerido por defecto: "$
 Cuentas disponibles: cash_usd (Efectivo USD), cash_bs (Efectivo BS), bancos_vef (Bancos Nac.), binance (Binance).
 Si el usuario menciona una fecha pasada, extráela en formato YYYY-MM-DD.
 El usuario dice: "${userInput}"
-Responde ÚNICAMENTE un JSON válido (sin markdown, sin explicación): {"monto": number, "moneda": "USD" | "BS", "tipo": "gasto" | "ingreso" | "ajuste_saldo", "cuenta_id": string|null, "categoria": string, "concepto": string, "fecha_pasada": string|null, "perfil_id": string}`;
+
+IMPORTANTE: Analiza si el mensaje describe un movimiento financiero (gasto, ingreso, ajuste) o si es una pregunta/conversación general.
+- Si es un movimiento financiero, responde con: {"tipo_respuesta": "transaccion", "monto": number, "moneda": "USD" | "BS", "tipo": "gasto" | "ingreso" | "ajuste_saldo", "cuenta_id": string|null, "categoria": string, "concepto": string, "fecha_pasada": string|null, "perfil_id": string}
+- Si es una pregunta o conversación general, responde con: {"tipo_respuesta": "chat", "mensaje": "tu respuesta aquí"}
+Responde ÚNICAMENTE un JSON válido sin markdown.`;
     
     try {
       const data = await fetchGeminiAI(prompt);
-      if (data.monto !== undefined || data.tipo === 'ajuste_saldo') {
+      if (data.tipo_respuesta === 'chat') {
+        addBotMsg(data.mensaje || 'No tengo una respuesta para eso.');
+      } else if (data.monto !== undefined || data.tipo === 'ajuste_saldo') {
         data.perfil = data.perfil_id && (data.perfil_id === 'personal' || businesses.find(b => b.id === data.perfil_id)) ? data.perfil_id : targetProfile;
         setRetroConfig({ isRetro: !!data.fecha_pasada, date: data.fecha_pasada || '', affectsBalance: !data.fecha_pasada, histRate: null, loading: false });
         setPendingTransaction(data);
         addBotMsg(`Detecté ${data.monto} ${data.moneda} (${data.tipo}) para ${getProfileName(data.perfil)}. Revisa y confirma.`);
-      } else addBotMsg("No pude interpretar la instrucción.");
-    } catch (e) { addBotMsg("Error de IA. Intenta de nuevo."); } finally { setIsTyping(false); }
+      } else {
+        addBotMsg(data.mensaje || "No pude interpretar la instrucción. Intenta describir un gasto o ingreso.");
+      }
+    } catch (err) { 
+      console.error('Chat error:', err);
+      addBotMsg(`⚠ Error de IA: ${err.message || 'Intenta de nuevo.'}`); 
+    } finally { setIsTyping(false); }
   };
 
   const confirmTx = async () => {
     if (!pendingTransaction?.cuenta_id || !fbUser) return;
-    const { tipo, cuenta_id, concepto, categoria, perfil, monto, moneda } = pendingTransaction;
+    const { tipo, cuenta_id, concepto, categoria, perfil, moneda } = pendingTransaction;
+    const monto = parseFloat(pendingTransaction.monto) || 0;
+    if (monto <= 0 && tipo !== 'ajuste_saldo') { addBotMsg('⚠ El monto debe ser mayor a 0.'); return; }
     const finalRate = retroConfig.isRetro ? (retroConfig.histRate || currentEffectiveRate) : currentEffectiveRate;
-    const amountUSD = moneda === 'BS' ? parseFloat((monto / finalRate).toFixed(2)) : parseFloat(monto);
+    const amountUSD = moneda === 'BS' ? parseFloat((monto / finalRate).toFixed(2)) : monto;
     
     if (retroConfig.affectsBalance) {
       const operation = tipo === 'ajuste_saldo' ? 'set' : (tipo === 'ingreso' ? 'add' : 'subtract');
@@ -424,22 +460,76 @@ Responde ÚNICAMENTE un JSON válido (sin markdown, sin explicación): {"monto":
   const handleImageUpload = (e) => {
     const file = e.target.files[0];
     if (!file) return;
+    
+    // Validate file type
+    const validTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/heic', 'image/heif'];
+    if (!validTypes.includes(file.type) && !file.type.startsWith('image/')) {
+      addBotMsg('⚠ Formato de imagen no soportado. Usa JPG, PNG o WebP.');
+      e.target.value = '';
+      return;
+    }
+    
     const reader = new FileReader();
     reader.onloadend = async () => {
       const base64String = String(reader.result).split(',')[1];
+      if (!base64String) {
+        addBotMsg('⚠ No se pudo leer la imagen. Intenta con otra.');
+        e.target.value = '';
+        return;
+      }
+      
       setIsAnalyzingImage(true);
       addBotMsg('📸 Procesando imagen... Extrayendo datos y segmentando gastos.');
       
-      const prompt = `Experto financiero.
-      1. Factura: Extrae comercio, monto total y moneda (USD/BS). Retorna 1 objeto.
-      2. Chat: Segmenta. Por cada gasto, crea un objeto.
-      JSON ARRAY estricto: [{"monto": numero, "moneda": "USD"|"BS", "concepto": "string", "tipo": "gasto", "fecha_pasada": "YYYY-MM-DD"|null}]`;
+      const prompt = `Eres un experto en análisis financiero de imágenes. Analiza esta imagen con detalle.
+
+Si es una factura, ticket o recibo:
+- Extrae el comercio/tienda, el monto total y la moneda (USD o BS).
+- Si hay fecha visible, extráela en formato YYYY-MM-DD.
+- Retorna 1 objeto por cada ítem o el total.
+
+Si es una captura de chat o conversación con gastos mencionados:
+- Segmenta cada gasto individual encontrado.
+- Por cada gasto, crea un objeto separado.
+
+Si es una transferencia bancaria o pago móvil:
+- Extrae el monto, fecha y concepto.
+
+Responde ÚNICAMENTE con un JSON array válido, sin explicaciones ni markdown:
+[{"monto": numero, "moneda": "USD" | "BS", "concepto": "descripcion del gasto", "tipo": "gasto", "fecha_pasada": "YYYY-MM-DD" | null}]
+
+Si no puedes extraer datos financieros, responde: []`;
       
       try {
-        const data = await fetchGeminiAI(prompt, base64String, file.type);
-        if (Array.isArray(data) && data.length > 0) {
+        // Use forceJSON=false for vision requests to avoid responseMimeType issues
+        const rawResponse = await fetchGeminiAI(prompt, base64String, file.type, false);
+        
+        // Parse the response - it comes back as raw text for vision
+        let data;
+        if (typeof rawResponse === 'string') {
+          data = extractJSON(rawResponse);
+          if (data === null) {
+            console.error('Could not parse image analysis response:', rawResponse);
+            addBotMsg('⚠ No logré interpretar la respuesta de la IA. Intenta con otra imagen.');
+            return;
+          }
+        } else {
+          data = rawResponse;
+        }
+        
+        // Ensure it's an array
+        if (!Array.isArray(data)) data = [data];
+        
+        // Filter out invalid items
+        data = data.filter(item => item && typeof item.monto === 'number' && item.monto > 0);
+        
+        if (data.length > 0) {
           const preparedItems = data.map((item, i) => ({
             ...item,
+            monto: parseFloat(item.monto) || 0,
+            moneda: (item.moneda || 'USD').toUpperCase(),
+            concepto: String(item.concepto || 'Gasto extraído'),
+            tipo: item.tipo || 'gasto',
             id: `draft_${Date.now()}_${i}`,
             perfil: activeProfile === 'consolidado' ? 'personal' : activeProfile,
             cuenta_id: '',
@@ -447,13 +537,19 @@ Responde ÚNICAMENTE un JSON válido (sin markdown, sin explicación): {"monto":
           }));
           setReviewItems(preparedItems);
           addBotMsg(`📊 Extraje ${preparedItems.length} registro(s). Revisa y confirma.`);
-        } else addBotMsg("⚠ No logré detectar gastos claros en la imagen.");
+        } else {
+          addBotMsg('⚠ No logré detectar gastos claros en la imagen. Intenta con una foto más clara de un ticket o factura.');
+        }
       } catch (err) { 
-        console.error("Image analysis error:", err);
-        addBotMsg(`🚨 Error procesando la imagen: ${err.message || "Error desconocido"}. Revisa la consola o tu API Key.`); 
+        console.error('Image analysis error:', err);
+        addBotMsg(`🚨 Error procesando la imagen: ${err.message || 'Error desconocido'}. Verifica tu API Key de Gemini.`); 
       } finally { 
         setIsAnalyzingImage(false); e.target.value = ''; 
       }
+    };
+    reader.onerror = () => {
+      addBotMsg('⚠ Error al leer el archivo de imagen.');
+      e.target.value = '';
     };
     reader.readAsDataURL(file);
   };
@@ -472,12 +568,13 @@ Responde ÚNICAMENTE un JSON válido (sin markdown, sin explicación): {"monto":
     }
     let updatedAccs = [...accounts];
     for (const item of reviewItems) {
-      const amountUSD = item.moneda === 'BS' ? parseFloat((item.monto / currentEffectiveRate).toFixed(2)) : parseFloat(item.monto);
+      const itemMonto = parseFloat(item.monto) || 0;
+      const amountUSD = item.moneda === 'BS' ? parseFloat((itemMonto / currentEffectiveRate).toFixed(2)) : itemMonto;
       updatedAccs = updateAccountBalance(item.cuenta_id, item.perfil, amountUSD, 'subtract', updatedAccs);
       await addDoc(getUserCollection(fbUser.uid, 'transactions'), {
         amount: amountUSD, type: 'expense', category: 'General', concept: String(item.concepto || `Movimiento Extraído`),
         date: new Date(`${item.dateStr}T12:00:00Z`).toISOString(), registration_date: new Date().toISOString(),
-        is_retroactive: false, affects_balance: true, monto_original: parseFloat(item.monto), moneda_original: String(item.moneda),
+        is_retroactive: false, affects_balance: true, monto_original: itemMonto, moneda_original: String(item.moneda),
         tasa_historica: currentEffectiveRate, cuenta_id: String(item.cuenta_id), perfil: String(item.perfil), author: activeAuthorId
       }).catch(console.error);
     }
@@ -809,7 +906,7 @@ Responde ÚNICAMENTE un JSON válido (sin markdown, sin explicación): {"monto":
                 {tempBusinesses.map((b, index) => (
                   <div key={b.id} className="flex gap-2 items-center">
                     <input type="text" maxLength={18} placeholder="Nombre del Negocio" value={b.name} onChange={e => {
-                      const updated = [...tempBusinesses]; updated[index].name = e.target.value; setTempBusinesses(updated);
+                      const updated = tempBusinesses.map((tb, i) => i === index ? { ...tb, name: e.target.value } : tb); setTempBusinesses(updated);
                     }} className="flex-1 bg-slate-50 p-3.5 rounded-xl font-bold text-sm text-slate-900 border border-slate-100 outline-none focus:border-emerald-400 focus:bg-white transition-all" />
                     {tempBusinesses.length > 1 && (
                       <button type="button" onClick={() => setTempBusinesses(tempBusinesses.filter(tb => tb.id !== b.id))} className="p-3 text-rose-400 hover:bg-rose-50 rounded-xl transition-colors"><Trash2 className="w-4 h-4" /></button>
