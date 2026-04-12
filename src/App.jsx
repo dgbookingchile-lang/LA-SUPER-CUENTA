@@ -9,7 +9,9 @@ import { auth, db, getUserCollection, getUserDocRef, getGlobalCollection } from 
 import { signInWithEmailAndPassword, createUserWithEmailAndPassword, onAuthStateChanged, signOut, GoogleAuthProvider, signInWithPopup } from 'firebase/auth';
 import { onSnapshot, addDoc, setDoc, deleteDoc, updateDoc } from 'firebase/firestore';
 
-const GEMINI_MODEL = "gemini-2.0-flash";
+const AI_MODEL_CHAT = "glm-4-flash"; // Económico/Gratis para chat
+const AI_MODEL_VISION = "glm-4v"; // Modelo con visión para facturas
+
 const PROFILE_COLORS = ['bg-emerald-500', 'bg-amber-500', 'bg-cyan-500', 'bg-pink-500', 'bg-rose-500', 'bg-blue-500'];
 const DEFAULT_ACCOUNTS = [
   { id: 'cash_usd', name: 'Efectivo USD', currency: 'USD', balances: { personal: 0, b1: 0 }, color: 'bg-emerald-100 text-emerald-600', icon: '💵' },
@@ -301,11 +303,58 @@ export default function App() {
     return null;
   };
 
+  const fetchAI = async (prompt, base64Data = null, mimeType = null, forceJSON = true) => {
+    const apiKey = import.meta.env.VITE_AI_API_KEY;
+    if (!apiKey) {
+      // Fallback a Gemini si no hay clave nueva (para no romper la app)
+      return fetchGeminiAI(prompt, base64Data, mimeType, forceJSON);
+    }
+    
+    // Formato de mensajes compatible con OpenAI/Zhipu
+    const messages = [{ role: "user", content: [] }];
+    
+    if (base64Data && mimeType) {
+      messages[0].content.push({ type: "image_url", image_url: { url: `data:${mimeType};base64,${base64Data}` } });
+      messages[0].content.push({ type: "text", text: prompt });
+    } else {
+      messages[0].content = prompt;
+    }
+
+    try {
+      const res = await fetch('https://open.bigmodel.cn/api/paas/v4/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${apiKey}`
+        },
+        body: JSON.stringify({
+          model: base64Data ? AI_MODEL_VISION : AI_MODEL_CHAT,
+          messages,
+          temperature: 0.1,
+          ...(forceJSON && !base64Data ? { response_format: { type: "json_object" } } : {})
+        })
+      });
+
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.error?.message || `Error AI (${res.status})`);
+      }
+
+      const data = await res.json();
+      const rawText = data.choices[0].message.content;
+      
+      if (!forceJSON) return rawText;
+      return extractJSON(rawText) || rawText;
+    } catch (err) {
+      console.error('AI Error:', err);
+      throw err;
+    }
+  };
+
   const fetchGeminiAI = async (prompt, base64Data = null, mimeType = null, forceJSON = true) => {
     const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
     if (!apiKey) throw new Error('VITE_GEMINI_API_KEY no configurada');
     
-    // For vision requests: image FIRST, then text prompt
     const parts = [];
     if (base64Data && mimeType) parts.push({ inlineData: { mimeType, data: base64Data } });
     parts.push({ text: prompt });
@@ -314,51 +363,17 @@ export default function App() {
     if (forceJSON && !base64Data) generationConfig.responseMimeType = "application/json";
     
     const requestBody = JSON.stringify({ contents: [{ parts }], generationConfig });
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`;
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
     
-    // Retry logic with exponential backoff for 429 (rate limit) errors
-    const MAX_RETRIES = 3;
-    let lastError = null;
-    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-      if (attempt > 0) {
-        const waitMs = Math.min(2000 * Math.pow(2, attempt - 1), 10000); // 2s, 4s, 8s
-        console.log(`Gemini 429 retry ${attempt}/${MAX_RETRIES}, waiting ${waitMs}ms...`);
-        await new Promise(r => setTimeout(r, waitMs));
-      }
-      
-      const res = await fetch(url, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: requestBody
-      });
-      
-      if (res.status === 429) {
-        lastError = new Error('Límite de solicitudes excedido. Espera unos segundos e intenta de nuevo.');
-        continue; // retry
-      }
-      
-      if (!res.ok) {
-        const errBody = await res.text().catch(() => '');
-        console.error('Gemini API error body:', errBody);
-        if (res.status === 400) throw new Error('Solicitud inválida. Revisa el formato de tu mensaje o imagen.');
-        if (res.status === 403) throw new Error('API Key sin permisos. Revisa tu VITE_GEMINI_API_KEY.');
-        throw new Error(`Error del servidor de IA (${res.status}). Intenta de nuevo.`);
-      }
-      
-      const data = await res.json();
-      const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
-      console.log('Gemini raw response:', rawText.substring(0, 500));
-      
-      if (!forceJSON) return rawText;
-      
-      const parsed = extractJSON(rawText);
-      if (parsed !== null) return parsed;
-      
-      console.error('Gemini JSON parse failed. Raw:', rawText);
-      throw new Error('No se pudo interpretar la respuesta de la IA');
-    }
+    const res = await fetch(url, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: requestBody
+    });
     
-    // All retries exhausted
-    throw lastError || new Error('Límite de solicitudes excedido tras varios intentos. Espera 1 minuto.');
+    if (!res.ok) throw new Error(`Error Gemini (${res.status})`);
+    const data = await res.json();
+    const rawText = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    return forceJSON ? extractJSON(rawText) : rawText;
   };
 
   const updateAccountBalance = (accId, pKey, amount, operation, accList = accounts) => {
@@ -405,7 +420,7 @@ IMPORTANTE: Analiza si el mensaje describe un movimiento financiero (gasto, ingr
 Responde ÚNICAMENTE un JSON válido sin markdown.`;
     
     try {
-      const data = await fetchGeminiAI(prompt);
+      const data = await fetchAI(prompt);
       if (data.tipo_respuesta === 'chat') {
         addBotMsg(data.mensaje || 'No tengo una respuesta para eso.');
       } else if (data.monto !== undefined || data.tipo === 'ajuste_saldo') {
@@ -528,7 +543,7 @@ Si no puedes extraer datos financieros, responde: []`;
       
       try {
         // Use forceJSON=false for vision requests to avoid responseMimeType issues
-        const rawResponse = await fetchGeminiAI(prompt, base64String, file.type, false);
+        const rawResponse = await fetchAI(prompt, base64String, file.type, false);
         
         // Parse the response - it comes back as raw text for vision
         let data;
